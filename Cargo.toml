@@ -1,0 +1,18 @@
+[package]
+name = "lz4-safe-rs"
+version = "0.1.0"
+authors = ["Nick Terrell <terrelln@fb.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "lz4_safe"
+
+[profile.release]
+debug = true
+
+[dependencies]
+lz4_flex = { version = "0.7.5", default-features = false, features = ["checked-decode"] }
+lz4-sys = "1.9.2"
+lz4 = "1.23.1"
+# lz4_flex = { version = "0.7.5" }
