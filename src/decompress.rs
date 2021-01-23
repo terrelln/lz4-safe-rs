@@ -1,4 +1,5 @@
-// TODO: short offsets
+use std::intrinsics::{likely, unlikely};
+use std::marker::PhantomData;
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum Lz4Error {
@@ -11,7 +12,7 @@ pub enum Lz4Error {
 
 type Lz4Result<T> = Result<T, Lz4Error>;
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum Lz4SequenceState {
     SequenceStart,
     TokenRead,
@@ -22,36 +23,83 @@ enum Lz4SequenceState {
     End,
 }
 
+struct Lz4Fast;
+struct Lz4End;
+
+trait Lz4Mode {
+    fn is_fast() -> bool;
+}
+
+impl Lz4Mode for Lz4Fast {
+    #[inline(always)]
+    fn is_fast() -> bool {
+        true
+    }
+}
+
+impl Lz4Mode for Lz4End {
+    #[inline(always)]
+    fn is_fast() -> bool {
+        false
+    }
+}
+
 #[derive(Debug)]
-struct Lz4Sequence {
+struct Lz4Sequence<Mode: Lz4Mode> {
     literal_length: usize,
     match_length: usize,
     offset: usize,
     state: Lz4SequenceState,
-    fast: bool,
+    _mode: PhantomData<Mode>,
 }
 
-impl Lz4Sequence {
-    fn new(fast: bool) -> Lz4Sequence {
+impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
+    fn new() -> Self {
         Lz4Sequence {
             literal_length: 0,
             match_length: 0,
             offset: 0,
             state: Lz4SequenceState::SequenceStart,
-            fast,
+            _mode: PhantomData {},
         }
     }
 
+    #[inline(always)]
+    fn to_end(&self, state: Lz4SequenceState) -> Lz4Sequence<Lz4End> {
+        Lz4Sequence {
+            literal_length: self.literal_length,
+            match_length: self.match_length,
+            offset: self.offset,
+            state,
+            _mode: PhantomData {},
+        }
+    }
+
+    #[inline(always)]
     fn is_fast(&self) -> bool {
-        self.fast
+        Mode::is_fast()
+    }
+
+    #[inline(always)]
+    fn check_state(&self, state: Lz4SequenceState) {
+        if !self.is_fast() {
+            assert_eq!(self.state, state);
+        }
+    }
+
+    #[inline(always)]
+    fn set_state(&mut self, state: Lz4SequenceState) {
+        if !self.is_fast() {
+            self.state = state;
+        }
     }
 
     // fn set_fast(&mut self) {
-    //     self.fast = true;
+    //     self.is_fast() = true;
     // }
 
     // fn set_slow(&mut self) {
-    //     self.fast = false;
+    //     self.is_fast() = false;
     // }
 }
 
@@ -67,58 +115,102 @@ const SHORT_MATCH_LENGTH_BYTES: usize = 0;
 const SHORT_MATCH_BYTES: usize = 18;
 const COPY_OVER_LENGTH: usize = 16;
 
-const MATCH_LENGTH_READ_REMAINING: usize = SHORT_MATCH_BYTES;
-const OFFSET_READ_REMAINING: usize = MATCH_LENGTH_READ_REMAINING + SHORT_MATCH_LENGTH_BYTES;
-const LITERALS_COPID_REMAINING: usize = OFFSET_READ_REMAINING + OFFSET_BYTES;
-const LITERAL_LENGTH_READ_REMAINING: usize = LITERALS_COPID_REMAINING + SHORT_LITERAL_BYTES;
-const TOKEN_READ_REMAINING: usize = LITERAL_LENGTH_READ_REMAINING + SHORT_LITERAL_LENGTH_BYTES;
-const SEQUENCE_START_REMAINING: usize = TOKEN_READ_REMAINING + TOKEN_BYTES;
+// const MATCH_LENGTH_READ_REMAINING: usize = SHORT_MATCH_BYTES;
+// const OFFSET_READ_REMAINING: usize = MATCH_LENGTH_READ_REMAINING + SHORT_MATCH_LENGTH_BYTES;
+// const LITERALS_COPID_REMAINING: usize = OFFSET_READ_REMAINING + OFFSET_BYTES;
+// const LITERAL_LENGTH_READ_REMAINING: usize = LITERALS_COPID_REMAINING + SHORT_LITERAL_BYTES;
+// const TOKEN_READ_REMAINING: usize = LITERAL_LENGTH_READ_REMAINING + SHORT_LITERAL_LENGTH_BYTES;
+// const SEQUENCE_START_REMAINING: usize = TOKEN_READ_REMAINING + TOKEN_BYTES;
+const HALF_FAST_LOOP_LEN: usize = 32;
+const FAST_LOOP_LEN: usize = 2 * HALF_FAST_LOOP_LEN;
 
 struct InputCursor<'a> {
     src: &'a [u8],
-    idx: usize,
 }
 
 impl InputCursor<'_> {
     fn new(src: &[u8]) -> InputCursor {
-        InputCursor { src, idx: 0 }
+        InputCursor { src }
     }
 
+    #[inline(always)]
     fn advance(&mut self, len: usize) {
-        self.idx += len;
-        // assert!(self.idx <= self.src.len());
+        self.src = &self.src[len..];
     }
 
-    fn len(&self) -> usize { self.src.len() - self.idx }
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.src.len()
+    }
 
-    fn is_empty(&self) -> bool { self.idx == self.src.len() }
+    #[inline(always)]
+    fn has(&self, len: usize) -> bool {
+        likely(len <= self.len())
+    }
 
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        unlikely(self.src.is_empty())
+    }
+
+    #[inline(always)]
     fn read_u8(&mut self) -> u8 {
-        let byte = self.src[self.idx];
-        self.idx += 1;
+        let byte = self.src[0];
+        self.advance(1);
         byte
     }
 
+    #[inline(always)]
     fn read_u16_le(&mut self) -> u16 {
-        let byte0 = self.src[self.idx] as u16;
-        let byte1 = self.src[self.idx+1] as u16;
-        self.idx += 2;
-        byte0 | (byte1 << 8)
+        let bytes = &self.src[..2];
+        let value = u16::from_le_bytes([bytes[0], bytes[1]]);
+        self.advance(2);
+        value
     }
 
-    fn read_varint(&mut self, token: usize) -> Lz4Result<usize> {
+    fn peek_u32_le(&self) -> u32 {
+        let bytes = &self.src[..4];
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    // When fast we know that we have at least
+    #[inline(always)]
+    fn read_varint(&mut self, token: usize, fast: bool) -> Lz4Result<usize> {
         let mut value = token;
+        if false && fast {
+            let value4 = self.peek_u32_le();
+            if likely(value4 != 0xFFFFFFFF) {
+                let ones = (value4.trailing_ones() >> 3) as usize;
+                value += 255 * ones;
+                value += self.src[ones] as usize;
+                self.advance(ones + 1);
+                return Ok(value);
+            }
+            value += 255 * 4;
+            self.advance(4);
+        }
+        if fast {
+            let next = self.read_u8() as usize;
+            value += next;
+            if next != 255 {
+                return Ok(value);
+            }
+        }
         loop {
             if self.is_empty() {
-                return Lz4Result::Err(Lz4Error::VarintCorrupted);
+                return Err(Lz4Error::VarintCorrupted);
             }
             let next = self.read_u8() as usize;
             value += next;
-            if next < 255 {
-                break;
+            if next != 255 {
+                return Ok(value);
             }
         }
-        Lz4Result::Ok(value)
+    }
+
+    #[inline(always)]
+    fn slice(&self, len: usize) -> &[u8] {
+        &self.src[..len]
     }
 }
 
@@ -129,8 +221,8 @@ struct OutputCursor<'a> {
 
 #[inline(always)]
 fn copy(dst: &mut OutputCursor, src: &mut InputCursor, len: usize) {
-    let dst_slice = &mut dst.dst[dst.idx..dst.idx+len];
-    let src_slice = &src.src[src.idx..src.idx+len];
+    let dst_slice = &mut dst.dst[dst.idx..dst.idx + len];
+    let src_slice = src.slice(len);
     dst_slice.copy_from_slice(src_slice);
 }
 
@@ -148,12 +240,13 @@ fn copy_stripe(dst: &mut [u8], src: &[u8], stripe: Stripe) {
     dst_stripe.copy_from_slice(src_stripe);
 }
 
+#[inline(always)]
 fn striped_copy(dst: &mut [u8], src: &[u8], len: Len, stripe: Stripe, fast: bool) {
     let mut idx = 0;
     if fast {
         loop {
-            let dst_stripe = &mut dst[idx..idx+stripe.0];
-            let src_stripe = &src[idx..idx+stripe.0];
+            let dst_stripe = &mut dst[idx..idx + stripe.0];
+            let src_stripe = &src[idx..idx + stripe.0];
             dst_stripe.copy_from_slice(src_stripe);
             idx += stripe.0;
             if idx >= len.0 {
@@ -168,17 +261,75 @@ fn striped_copy(dst: &mut [u8], src: &[u8], len: Len, stripe: Stripe, fast: bool
 #[inline(always)]
 fn copy_stripe_within(buf: &mut [u8], from: From, to: To, stripe: Stripe) {
     // assert!(from.0 + stripe.0 <= to.0);
-    // let (src, dst) = buf.split_at_mut(to.0);
-    // copy_stripe(dst, &src[from.0..], stripe);
-    let from_slice = from.0..from.0+stripe.0;
-    buf.copy_within(from_slice, to.0);
+    let (src, dst) = buf.split_at_mut(to.0);
+    copy_stripe(dst, &src[from.0..], stripe);
+}
+
+#[inline(always)]
+fn short_duplicating_copy(buf: &mut [u8], mut idx: Idx, offset: Offset, len: Len, fast: bool) {
+    let mut pattern = [0u8; 16];
+    let mut pattern_len = match offset.0 {
+        1 => {
+            pattern.fill(buf[idx.0 - 1]);
+            16
+        }
+        2 => {
+            pattern[0..2].copy_from_slice(&buf[idx.0 - 2..idx.0]);
+            pattern.copy_within(0..2, 2);
+            pattern.copy_within(0..4, 4);
+            pattern.copy_within(0..8, 8);
+            16
+        }
+        4 => {
+            pattern[0..4].copy_from_slice(&buf[idx.0 - 4..idx.0]);
+            pattern.copy_within(0..4, 4);
+            pattern.copy_within(0..8, 8);
+            16
+        }
+        8 => {
+            pattern[0..8].copy_from_slice(&buf[idx.0 - 8..idx.0]);
+            pattern.copy_within(0..8, 8);
+            16
+        }
+        off => {
+            pattern[0..off].copy_from_slice(&buf[idx.0 - off..idx.0]);
+            let mut pattern_length = off;
+            while pattern_length <= 8 {
+                pattern.copy_within(0..pattern_length, pattern_length);
+                pattern_length *= 2;
+            }
+            pattern_length
+        }
+    };
+    let end = idx.0 + len.0;
+    if fast {
+        loop {
+            copy_stripe(&mut buf[idx.0..idx.0+16], &pattern, Stripe(16));
+            idx.0 += pattern_len;
+            if idx.0 >= end {
+                return;
+            }
+        }
+    } else {
+        while idx.0 + 16 <= end {
+            copy_stripe(&mut buf[idx.0..idx.0+16], &pattern, Stripe(16));
+            idx.0 += pattern_len;
+        }
+        if idx.0 + pattern_len <= end {
+            copy_stripe(&mut buf[idx.0..idx.0+pattern_len], &pattern, Stripe(pattern_len));
+            idx.0 += pattern_len;
+        }
+        for i in 0..(end - idx.0) {
+            buf[idx.0 + i] = pattern[i];
+        }
+    }
 }
 
 #[inline(always)]
 fn duplicating_copy(buf: &mut [u8], mut idx: Idx, offset: Offset, len: Len, fast: bool) {
     const COPY_STRIPE: usize = 16;
     let end = idx.0 + len.0;
-    if offset.0 >= COPY_STRIPE {
+    if likely(offset.0 >= COPY_STRIPE) {
         if fast {
             loop {
                 copy_stripe_within(buf, From(idx.0 - offset.0), To(idx.0), Stripe(COPY_STRIPE));
@@ -189,18 +340,19 @@ fn duplicating_copy(buf: &mut [u8], mut idx: Idx, offset: Offset, len: Len, fast
             }
             return;
         } else {
-            while idx.0 + COPY_STRIPE < end {
+            while idx.0 + COPY_STRIPE <= end {
                 copy_stripe_within(buf, From(idx.0 - offset.0), To(idx.0), Stripe(COPY_STRIPE));
                 idx.0 += COPY_STRIPE;
             }
-            // for idx in idx.0..end {
-            //     buf[idx] = buf[idx - offset.0];
-            // }
+            for idx in idx.0..end {
+                buf[idx] = buf[idx - offset.0];
+            }
         }
-    }
-    // TODO: Optimize short offsets
-    for idx in idx.0..end {
-        buf[idx] = buf[idx - offset.0];
+    } else {
+        // for idx in idx.0..end {
+        //     buf[idx] = buf[idx - offset.0];
+        // }
+        short_duplicating_copy(buf, idx, offset, len, fast);
     }
 }
 
@@ -211,10 +363,10 @@ impl OutputCursor<'_> {
 
     #[inline(always)]
     fn validate_offset(&self, offset: usize) -> Lz4Result<()> {
-        if offset <= self.idx {
-            Lz4Result::Ok(())
+        if likely(offset <= self.idx) {
+            Ok(())
         } else {
-            Lz4Result::Err(Lz4Error::OffsetTooLarge)
+            Err(Lz4Error::OffsetTooLarge)
         }
     }
 
@@ -225,7 +377,8 @@ impl OutputCursor<'_> {
 
     #[inline(always)]
     fn has(&self, bytes: usize) -> bool {
-        self.idx + bytes <= self.dst.len()
+        likely(self.idx + bytes <= self.dst.len())
+        // bytes <= self.len()
     }
 
     #[inline(always)]
@@ -236,52 +389,65 @@ impl OutputCursor<'_> {
 
     #[inline(always)]
     fn copy_literals(&mut self, src: &mut InputCursor, literal_length: usize, fast: bool) {
-        if fast && literal_length <= 32 {
+        if fast && likely(literal_length <= 32) {
             let dst_slice = &mut self.dst[self.idx..self.idx + 32];
-            let src_slice = &src.src[src.idx..src.idx + 32];
-            dst_slice.copy_from_slice(src_slice);
+            dst_slice.copy_from_slice(src.slice(32));
         } else {
-            striped_copy(&mut self.dst[self.idx..], &src.src[src.idx..], Len(literal_length), Stripe(16), fast);
+            striped_copy(
+                &mut self.dst[self.idx..],
+                src.src,
+                Len(literal_length),
+                Stripe(16),
+                fast,
+            );
         }
-        // if fast {
-        //     // striped_over_copy(dst: &mut [u8], src: &[u8], len: Len, stripe: Stripe, fast: bool)
-        //     // if literal_length <= 16 {
-        //     //     copy(self, src, 16);
-        //     // }
-        // } else {
-
-        // }
-        // if fast && literal_length <= 16 {
-        //     // copy_stripe(&mut self.dst[self.idx..self.idx+16], &src.src[src.idx..src.idx+16], Stripe(16))
-        // } else {
-        //     copy(self, src, literal_length);
-        // }
         self.advance(literal_length);
         src.advance(literal_length);
+    }
+
+    #[inline(always)]
+    fn copy_match_prefix(&mut self, offset: usize, prefix_length: usize)  {
+        if likely(offset >= prefix_length) {
+            copy_stripe_within(self.dst, From(self.idx - offset), To(self.idx), Stripe(prefix_length));
+        // } else {
+        //     duplicating_copy(self.dst, Idx(self.idx), Offset(offset), Len(prefix_length), true);
+        }
     }
 
     #[inline(always)]
     fn copy_match(&mut self, offset: usize, match_length: usize, fast: bool) {
         // TODO: Optimize
         if fast {
-            if fast && offset >= 18 && match_length <= 18 {
+            if fast && likely(offset >= 18 && match_length <= 18) {
                 copy_stripe_within(self.dst, From(self.idx - offset), To(self.idx), Stripe(18));
             } else {
-                duplicating_copy(self.dst, Idx(self.idx), Offset(offset), Len(match_length), true);
+                duplicating_copy(
+                    self.dst,
+                    Idx(self.idx),
+                    Offset(offset),
+                    Len(match_length),
+                    true,
+                );
             }
         } else {
-            duplicating_copy(self.dst, Idx(self.idx), Offset(offset), Len(match_length), false);
+            duplicating_copy(
+                self.dst,
+                Idx(self.idx),
+                Offset(offset),
+                Len(match_length),
+                false,
+            );
         }
         // if fast && offset >= 18 && match_length <= 18 {
         //     copy_stripe_within(self.dst, From(self.idx - offset), To(self.idx), Stripe(18));
         // } else {
-            // let midx = self.idx - offset;
-            // let mslice = midx..midx+match_length;
-            // self.dst.copy_within(mslice, self.idx);
-            // let _ = fast;
-            // for i in 0..match_length {
-            //     self.dst[self.idx + i] = self.dst[self.idx + i - offset];
-            // }
+        // let midx = self.idx - offset;
+        // let mslice = midx..midx+match_length;
+        // self.dst.copy_within(mslice, self.idx);
+        // let _ = fast;
+        // for i in 0..match_length {
+        //     self.dst[self.idx + i] = self.dst[self.idx + i - offset];
+        // }
         // }
         // let _ = fast;
         // for i in 0..match_length {
@@ -291,174 +457,227 @@ impl OutputCursor<'_> {
     }
 }
 
-impl Lz4Sequence {
+#[derive(PartialEq, Eq)]
+enum Lz4Status {
+    Fast,
+    End,
+}
+
+impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
     #[inline(always)]
-    fn read_token(&mut self, src: &mut InputCursor) -> Lz4Result<()> {
-        assert_eq!(self.state, Lz4SequenceState::SequenceStart);
+    fn read_token(&mut self, src: &mut InputCursor) {
+        self.check_state(Lz4SequenceState::SequenceStart);
         // No bounds check because if we were out of bytes we would be in the
         // end state.
         let token = src.read_u8();
         let literal_token = (token >> 4) as usize;
         let match_token = ((token & 0xF) as usize) + MIN_MATCH;
 
-        self.state = Lz4SequenceState::TokenRead;
+        self.set_state(Lz4SequenceState::TokenRead);
         self.literal_length = literal_token;
         self.match_length = match_token;
-
-        Lz4Result::Ok(())
     }
 
     #[inline(always)]
-    fn read_literal_length(&mut self, out: &OutputCursor, src: &mut InputCursor) -> Lz4Result<()> {
-        assert_eq!(self.state, Lz4SequenceState::TokenRead);
+    fn read_literal_length(
+        &mut self,
+        out: &OutputCursor,
+        src: &mut InputCursor,
+    ) -> Lz4Result<Lz4Status> {
+        self.check_state(Lz4SequenceState::TokenRead);
         if self.literal_length != LITERAL_TOKEN_MAX {
-            if self.fast {
-                self.state = Lz4SequenceState::LiteralLengthRead;
-                return Lz4Result::Ok(());
+            if self.is_fast() {
+                self.set_state(Lz4SequenceState::LiteralLengthRead);
+                // Output doesn't need to be checked - it is checked in read_match_length.
+                // We need enough input to get back to this check: literal length + offset
+                // + next token.
+                let status = if src.has(HALF_FAST_LOOP_LEN + TOKEN_BYTES + OFFSET_BYTES) {
+                    Lz4Status::Fast
+                } else {
+                    Lz4Status::End
+                };
+                return Ok(status);
             }
         } else {
-            self.literal_length = src.read_varint(self.literal_length)?;
+            self.literal_length = src.read_varint(self.literal_length, self.is_fast())?;
         }
 
-        let has = |len| out.has(len) && len <= src.len();
+        let has = |len| out.has(len) && src.has(len);
 
-        let over_length = self.literal_length + LITERALS_COPID_REMAINING;
-        if self.fast && has(over_length) {
-            self.state = Lz4SequenceState::LiteralLengthRead;
-            Lz4Result::Ok(())
+        // Need space for the over-copy
+        let over_length = self.literal_length + HALF_FAST_LOOP_LEN;
+        if self.is_fast() && has(over_length) {
+            self.set_state(Lz4SequenceState::LiteralLengthRead);
+            Ok(Lz4Status::Fast)
         } else {
-            self.fast = false;
             if has(self.literal_length) {
-                self.state = Lz4SequenceState::LiteralLengthRead;
-                Lz4Result::Ok(())
+                self.set_state(Lz4SequenceState::LiteralLengthRead);
+                Ok(Lz4Status::End)
             } else {
-                Lz4Result::Err(Lz4Error::LiteralLengthTooLong)
+                Err(Lz4Error::LiteralLengthTooLong)
             }
         }
     }
 
     #[inline(always)]
-    fn copy_literals(&mut self, out: &mut OutputCursor, src: &mut InputCursor) -> Lz4Result<()> {
-        assert_eq!(self.state, Lz4SequenceState::LiteralLengthRead);
+    fn copy_literals(&mut self, out: &mut OutputCursor, src: &mut InputCursor) {
+        self.check_state(Lz4SequenceState::LiteralLengthRead);
         // Literal length already validated
-        out.copy_literals(src, self.literal_length, self.fast);
-        self.state = Lz4SequenceState::LiteralsCopied;
-        Lz4Result::Ok(())
+        out.copy_literals(src, self.literal_length, self.is_fast());
+        self.set_state(Lz4SequenceState::LiteralsCopied);
     }
 
     #[inline(always)]
     fn read_offset(&mut self, out: &OutputCursor, src: &mut InputCursor) -> Lz4Result<()> {
-        assert_eq!(self.state, Lz4SequenceState::LiteralsCopied);
-        if !self.fast {
+        self.check_state(Lz4SequenceState::LiteralsCopied);
+        if !self.is_fast() {
             if src.is_empty() {
-                self.state = Lz4SequenceState::End;
-                return Lz4Result::Ok(());
+                self.set_state(Lz4SequenceState::End);
+                return Ok(());
             }
-            if src.len() < 2 {
-                return Lz4Result::Err(Lz4Error::OffsetCutShort);
+            if !src.has(2) {
+                return Err(Lz4Error::OffsetCutShort);
             }
         }
         let offset = src.read_u16_le() as usize;
 
         out.validate_offset(offset)?;
 
-        self.state = Lz4SequenceState::OffsetRead;
+        self.set_state(Lz4SequenceState::OffsetRead);
         self.offset = offset;
-        Lz4Result::Ok(())
+        Ok(())
     }
 
     #[inline(always)]
-    fn read_match_length(&mut self, out: &OutputCursor, src: &mut InputCursor) -> Lz4Result<()> {
-        assert_eq!(self.state, Lz4SequenceState::OffsetRead);
+    fn read_match_length(
+        &mut self,
+        out: &OutputCursor,
+        src: &mut InputCursor,
+    ) -> Lz4Result<Lz4Status> {
+        self.check_state(Lz4SequenceState::OffsetRead);
         if self.match_length != MATCH_TOKEN_MAX {
-            if self.fast {
-                // No need for validation
-                self.state = Lz4SequenceState::MatchLengthRead;
-                return Lz4Result::Ok(());
+            if self.is_fast() {
+                self.set_state(Lz4SequenceState::MatchLengthRead);
+                let seq = if out.has(FAST_LOOP_LEN) {
+                    Lz4Status::Fast
+                } else {
+                    Lz4Status::End
+                };
+                return Ok(seq);
             }
         } else {
-            self.match_length = src.read_varint(self.match_length)?;
+            self.match_length = src.read_varint(self.match_length, self.is_fast())?;
         };
 
-        if self.fast && out.has(self.match_length + COPY_OVER_LENGTH) {
-            self.state = Lz4SequenceState::MatchLengthRead;
-            Lz4Result::Ok(())
+        if self.is_fast() && out.has(self.match_length + FAST_LOOP_LEN) {
+            self.set_state(Lz4SequenceState::MatchLengthRead);
+            Ok(Lz4Status::Fast)
         } else if out.has(self.match_length) {
-            self.state = Lz4SequenceState::MatchLengthRead;
-            self.fast = false;
-            Lz4Result::Ok(())
+            self.set_state(Lz4SequenceState::MatchLengthRead);
+            Ok(Lz4Status::End)
         } else {
-            Lz4Result::Err(Lz4Error::MatchLengthTooLong)
+            Err(Lz4Error::MatchLengthTooLong)
         }
     }
 
     #[inline(always)]
-    fn copy_match(&mut self, out: &mut OutputCursor) -> Lz4Result<()> {
-        assert_eq!(self.state, Lz4SequenceState::MatchLengthRead);
-        out.copy_match(self.offset, self.match_length, self.fast);
-        self.state = Lz4SequenceState::SequenceStart;
-        Lz4Result::Ok(())
-        // TODO: Do we want to not require the end of block condition?
+    fn copy_match_prefix(&mut self, out: &mut OutputCursor) {
+        self.check_state(Lz4SequenceState::MatchLengthRead);
+        if self.is_fast() {
+            out.copy_match_prefix(self.offset, 18);
+        }
     }
 
+    #[inline(always)]
+    fn copy_match(&mut self, out: &mut OutputCursor) {
+        // if self.is_fast() {
+        //     if likely(self.offset >= 18 && self.match_length <= 18) {
+        //         out.advance(self.match_length);
+        //     } else {
+        //         out.advance(18);
+        //         out.copy_match(self.offset, self.match_length - 18, true);
+        //     }
+        // } else {
+        //     self.check_state(Lz4SequenceState::MatchLengthRead);
+        //     out.copy_match(self.offset, self.match_length, false);
+        //     self.set_state(Lz4SequenceState::SequenceStart);
+        // }
+        // if self.is_fast() && likely(self.match_length <= 18) {
+        //     out.advance(self.match_length);
+        // } else {
+        //     self.check_state(Lz4SequenceState::MatchLengthRead);
+        //     out.copy_match(self.offset, self.match_length, self.is_fast());
+        //     self.set_state(Lz4SequenceState::SequenceStart);
+        // }
+        // TODO: Do we want to not require the end of block condition?
+        self.check_state(Lz4SequenceState::MatchLengthRead);
+        out.copy_match(self.offset, self.match_length, self.is_fast());
+        self.set_state(Lz4SequenceState::SequenceStart);
+    }
+}
+
+impl Lz4Sequence<Lz4End> {
     fn next(&mut self, out: &mut OutputCursor, src: &mut InputCursor) -> Lz4Result<()> {
         match self.state {
-            Lz4SequenceState::SequenceStart => self.read_token(src),
-            Lz4SequenceState::TokenRead => self.read_literal_length(out, src),
-            Lz4SequenceState::LiteralLengthRead => self.copy_literals(out, src),
+            Lz4SequenceState::SequenceStart => Ok(self.read_token(src)),
+            Lz4SequenceState::TokenRead => {
+                self.read_literal_length(out, src)?;
+                Ok(())
+            }
+            Lz4SequenceState::LiteralLengthRead => Ok(self.copy_literals(out, src)),
             Lz4SequenceState::LiteralsCopied => self.read_offset(out, src),
-            Lz4SequenceState::OffsetRead => self.read_match_length(out, src),
-            Lz4SequenceState::MatchLengthRead => self.copy_match(out),
+            Lz4SequenceState::OffsetRead => {
+                self.read_match_length(out, src)?;
+                Ok(())
+            }
+            Lz4SequenceState::MatchLengthRead => Ok(self.copy_match(out)),
             Lz4SequenceState::End => panic!("Logic error!"),
         }
     }
 }
 
+type EndLz4Sequence = Lz4Sequence<Lz4End>;
+type FastLz4Sequence = Lz4Sequence<Lz4Fast>;
+
 pub fn decompress(dst: &mut [u8], src: &[u8]) -> Lz4Result<usize> {
-    let mut seq = Lz4Sequence::new(false);
+    let mut end_seq = EndLz4Sequence::new();
     let mut out = OutputCursor::new(dst);
     let mut input = InputCursor::new(src);
     // Fast loop
 
     // TODO: We shouldn't need this top of loop check.
     // Outer if then loop. Each condition will check cyclically
-    while input.len() >= SEQUENCE_START_REMAINING && out.has(SEQUENCE_START_REMAINING) {
-        // Initial state
-        seq = Lz4Sequence::new(true);
-        assert!(seq.is_fast());
+    if input.has(FAST_LOOP_LEN) && out.has(FAST_LOOP_LEN) {
+        loop {
+            // Initial state
+            let mut fast_seq = FastLz4Sequence::new();
 
-        seq.read_token(&mut input)?;
-        assert!(seq.is_fast());
+            fast_seq.read_token(&mut input);
 
-        seq.read_literal_length(&out, &mut input)?;
-        if !seq.is_fast() {
-            break;
+            let status = fast_seq.read_literal_length(&out, &mut input)?;
+            if status == Lz4Status::End {
+                end_seq = fast_seq.to_end(Lz4SequenceState::LiteralLengthRead);
+                break;
+            }
+
+            fast_seq.copy_literals(&mut out, &mut input);
+
+            fast_seq.read_offset(&out, &mut input)?;
+
+            let status = fast_seq.read_match_length(&out, &mut input)?;
+            // fast_seq.copy_match_prefix(&mut out);
+            if status == Lz4Status::End {
+                end_seq = fast_seq.to_end(Lz4SequenceState::MatchLengthRead);
+                break;
+            }
+
+            fast_seq.copy_match(&mut out);
         }
-
-        seq.copy_literals(&mut out, &mut input)?;
-        assert!(seq.is_fast());
-
-        seq.read_offset(&out, &mut input)?;
-        assert!(seq.is_fast());
-
-        seq.read_match_length(&out, &mut input)?;
-        if !seq.is_fast() {
-            break;
-        }
-
-        seq.copy_match(&mut out)?;
-        assert!(seq.is_fast());
     }
     // End loop
-    seq.fast = false;
-    while !matches!(seq.state, Lz4SequenceState::End) {
-        seq.next(&mut out, &mut input)?;
+    while !matches!(end_seq.state, Lz4SequenceState::End) {
+        end_seq.next(&mut out, &mut input)?;
     }
 
-    Lz4Result::Ok(out.idx)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
+    Ok(out.idx)
 }

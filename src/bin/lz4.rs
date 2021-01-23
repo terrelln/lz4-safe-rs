@@ -2,11 +2,13 @@ use std::fs::File;
 use std::io::{Read,Write};
 use std::env;
 use std::os::raw::{c_int, c_char};
+use std::time::Instant;
 
 use lz4_safe::decompress;
 use lz4_flex::decompress_into;
 use lz4_sys::LZ4_decompress_safe;
 use lz4::block;
+use lz_fear::raw::decompress_raw;
 
 fn lz4_decompress(dst: &mut [u8], src: &[u8]) -> Result<usize, ()> {
     unsafe {
@@ -44,21 +46,35 @@ fn main() {
     let data = read_file(&args[1]).expect("File read failed");
     // let mut decompressed = block::decompress(&data, Some(10000000)).expect("lz4-block failed");
     let mut decompressed = Vec::new();
-    decompressed.resize(10 * data.len(), 0);
-    let dsize = decompress(&mut decompressed, &data).expect("Lz4 decompression failed");
+    decompressed.resize(std::cmp::max(10 * data.len(), 1 << 20), 0);
+    let dsize = lz4_decompress(&mut decompressed, &data).expect("Lz4 decompression failed");
+    // let dsize = decompress(&mut decompressed, &data).expect("Lz4 decompression failed");
     decompressed.resize(dsize, 0);
+    // let mut time = None;
+    let start = Instant::now();
     for _ in 0..100 {
         if false {
             decompress_into(&data, &mut decompressed).expect("Flex failed");
         } else if false {
-        } else if false {
             block::decompress(&data, Some(dsize as i32)).expect("lz4-block failed");
         } else if false {
             let _dsize = lz4_decompress(&mut decompressed, &data).expect("Lz4 decompression failed");
+        } else if false {
+            decompress_raw(&data, &[], &mut decompressed, dsize * 10).expect("lz-fear decompression failed");
         } else {
             let _dsize = decompress(&mut decompressed, &data).expect("Lz4 decompression failed");
         }
+        // match time {
+        //     None => time = Some(stop - start),
+        //     Some(t) if stop - start < t => time = Some(stop - start),
+        //     _ => {}
+        // }
     }
+    let stop = Instant::now();
+    let bytes = dsize * 100;
+    // let time = time.unwrap();
+    let time = stop - start;
+    println!("{} bytes processed in {:?} = {:.1} MB/s", bytes, time, (bytes as f64) / (time.as_micros() as f64));
     write_file(&args[2], &decompressed).expect("File write failed");
 
 }
