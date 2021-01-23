@@ -115,12 +115,6 @@ const SHORT_MATCH_LENGTH_BYTES: usize = 0;
 const SHORT_MATCH_BYTES: usize = 18;
 const COPY_OVER_LENGTH: usize = 16;
 
-// const MATCH_LENGTH_READ_REMAINING: usize = SHORT_MATCH_BYTES;
-// const OFFSET_READ_REMAINING: usize = MATCH_LENGTH_READ_REMAINING + SHORT_MATCH_LENGTH_BYTES;
-// const LITERALS_COPID_REMAINING: usize = OFFSET_READ_REMAINING + OFFSET_BYTES;
-// const LITERAL_LENGTH_READ_REMAINING: usize = LITERALS_COPID_REMAINING + SHORT_LITERAL_BYTES;
-// const TOKEN_READ_REMAINING: usize = LITERAL_LENGTH_READ_REMAINING + SHORT_LITERAL_LENGTH_BYTES;
-// const SEQUENCE_START_REMAINING: usize = TOKEN_READ_REMAINING + TOKEN_BYTES;
 const HALF_FAST_LOOP_LEN: usize = 32;
 const FAST_LOOP_LEN: usize = 2 * HALF_FAST_LOOP_LEN;
 
@@ -168,6 +162,7 @@ impl InputCursor<'_> {
         value
     }
 
+    #[inline(always)]
     fn peek_u32_le(&self) -> u32 {
         let bytes = &self.src[..4];
         u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
@@ -268,7 +263,7 @@ fn copy_stripe_within(buf: &mut [u8], from: From, to: To, stripe: Stripe) {
 #[inline(always)]
 fn short_duplicating_copy(buf: &mut [u8], mut idx: Idx, offset: Offset, len: Len, fast: bool) {
     let mut pattern = [0u8; 16];
-    let mut pattern_len = match offset.0 {
+    let pattern_len = match offset.0 {
         1 => {
             pattern.fill(buf[idx.0 - 1]);
             16
@@ -294,6 +289,7 @@ fn short_duplicating_copy(buf: &mut [u8], mut idx: Idx, offset: Offset, len: Len
         off => {
             pattern[0..off].copy_from_slice(&buf[idx.0 - off..idx.0]);
             let mut pattern_length = off;
+            // TODO: SIMD pattern code
             while pattern_length <= 8 {
                 pattern.copy_within(0..pattern_length, pattern_length);
                 pattern_length *= 2;
@@ -418,9 +414,9 @@ impl OutputCursor<'_> {
     fn copy_match(&mut self, offset: usize, match_length: usize, fast: bool) {
         // TODO: Optimize
         if fast {
-            if fast && likely(offset >= 18 && match_length <= 18) {
-                copy_stripe_within(self.dst, From(self.idx - offset), To(self.idx), Stripe(18));
-            } else {
+            // if fast && likely(offset >= 18 && match_length <= 18) {
+            //     copy_stripe_within(self.dst, From(self.idx - offset), To(self.idx), Stripe(18));
+            // } else {
                 duplicating_copy(
                     self.dst,
                     Idx(self.idx),
@@ -428,7 +424,7 @@ impl OutputCursor<'_> {
                     Len(match_length),
                     true,
                 );
-            }
+            // }
         } else {
             duplicating_copy(
                 self.dst,
@@ -454,6 +450,11 @@ impl OutputCursor<'_> {
         //     self.dst[self.idx + i] = self.dst[self.idx + i - offset];
         // }
         self.advance(match_length);
+    }
+
+    #[inline(always)]
+    fn slice(&mut self, len: usize) -> &mut [u8] {
+        &mut self.dst[self.idx..self.idx+len]
     }
 }
 
@@ -481,17 +482,20 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
     #[inline(always)]
     fn read_literal_length(
         &mut self,
-        out: &OutputCursor,
+        out: &mut OutputCursor,
         src: &mut InputCursor,
     ) -> Lz4Result<Lz4Status> {
         self.check_state(Lz4SequenceState::TokenRead);
         if self.literal_length != LITERAL_TOKEN_MAX {
             if self.is_fast() {
-                self.set_state(Lz4SequenceState::LiteralLengthRead);
                 // Output doesn't need to be checked - it is checked in read_match_length.
                 // We need enough input to get back to this check: literal length + offset
-                // + next token.
-                let status = if src.has(HALF_FAST_LOOP_LEN + TOKEN_BYTES + OFFSET_BYTES) {
+                // + next token + next short literal length.
+                copy_stripe(out.slice(16), src.slice(16), Stripe(16));
+                src.advance(self.literal_length);
+                out.advance(self.literal_length);
+                self.set_state(Lz4SequenceState::LiteralsCopied);
+                let status = if src.has(FAST_LOOP_LEN) {
                     Lz4Status::Fast
                 } else {
                     Lz4Status::End
@@ -507,11 +511,13 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
         // Need space for the over-copy
         let over_length = self.literal_length + HALF_FAST_LOOP_LEN;
         if self.is_fast() && has(over_length) {
-            self.set_state(Lz4SequenceState::LiteralLengthRead);
+            out.copy_literals(src, self.literal_length, true);
+            self.set_state(Lz4SequenceState::LiteralsCopied);
             Ok(Lz4Status::Fast)
         } else {
             if has(self.literal_length) {
-                self.set_state(Lz4SequenceState::LiteralLengthRead);
+                out.copy_literals(src, self.literal_length, false);
+                self.set_state(Lz4SequenceState::LiteralsCopied);
                 Ok(Lz4Status::End)
             } else {
                 Err(Lz4Error::LiteralLengthTooLong)
@@ -551,13 +557,19 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
     #[inline(always)]
     fn read_match_length(
         &mut self,
-        out: &OutputCursor,
+        out: &mut OutputCursor,
         src: &mut InputCursor,
     ) -> Lz4Result<Lz4Status> {
         self.check_state(Lz4SequenceState::OffsetRead);
         if self.match_length != MATCH_TOKEN_MAX {
             if self.is_fast() {
-                self.set_state(Lz4SequenceState::MatchLengthRead);
+                if likely(self.offset >= 18) {
+                    copy_stripe_within(out.dst, From(out.idx - self.offset), To(out.idx), Stripe(18));
+                    out.advance(self.match_length);
+                } else {
+                    out.copy_match(self.offset, self.match_length, true);
+                }
+                self.set_state(Lz4SequenceState::SequenceStart);
                 let seq = if out.has(FAST_LOOP_LEN) {
                     Lz4Status::Fast
                 } else {
@@ -570,10 +582,12 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
         };
 
         if self.is_fast() && out.has(self.match_length + FAST_LOOP_LEN) {
-            self.set_state(Lz4SequenceState::MatchLengthRead);
+            out.copy_match(self.offset, self.match_length, true);
+            self.set_state(Lz4SequenceState::SequenceStart);
             Ok(Lz4Status::Fast)
         } else if out.has(self.match_length) {
-            self.set_state(Lz4SequenceState::MatchLengthRead);
+            out.copy_match(self.offset, self.match_length, false);
+            self.set_state(Lz4SequenceState::SequenceStart);
             Ok(Lz4Status::End)
         } else {
             Err(Lz4Error::MatchLengthTooLong)
@@ -581,35 +595,7 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
     }
 
     #[inline(always)]
-    fn copy_match_prefix(&mut self, out: &mut OutputCursor) {
-        self.check_state(Lz4SequenceState::MatchLengthRead);
-        if self.is_fast() {
-            out.copy_match_prefix(self.offset, 18);
-        }
-    }
-
-    #[inline(always)]
     fn copy_match(&mut self, out: &mut OutputCursor) {
-        // if self.is_fast() {
-        //     if likely(self.offset >= 18 && self.match_length <= 18) {
-        //         out.advance(self.match_length);
-        //     } else {
-        //         out.advance(18);
-        //         out.copy_match(self.offset, self.match_length - 18, true);
-        //     }
-        // } else {
-        //     self.check_state(Lz4SequenceState::MatchLengthRead);
-        //     out.copy_match(self.offset, self.match_length, false);
-        //     self.set_state(Lz4SequenceState::SequenceStart);
-        // }
-        // if self.is_fast() && likely(self.match_length <= 18) {
-        //     out.advance(self.match_length);
-        // } else {
-        //     self.check_state(Lz4SequenceState::MatchLengthRead);
-        //     out.copy_match(self.offset, self.match_length, self.is_fast());
-        //     self.set_state(Lz4SequenceState::SequenceStart);
-        // }
-        // TODO: Do we want to not require the end of block condition?
         self.check_state(Lz4SequenceState::MatchLengthRead);
         out.copy_match(self.offset, self.match_length, self.is_fast());
         self.set_state(Lz4SequenceState::SequenceStart);
@@ -654,24 +640,24 @@ pub fn decompress(dst: &mut [u8], src: &[u8]) -> Lz4Result<usize> {
 
             fast_seq.read_token(&mut input);
 
-            let status = fast_seq.read_literal_length(&out, &mut input)?;
+            let status = fast_seq.read_literal_length(&mut out, &mut input)?;
             if status == Lz4Status::End {
-                end_seq = fast_seq.to_end(Lz4SequenceState::LiteralLengthRead);
+                end_seq = fast_seq.to_end(Lz4SequenceState::LiteralsCopied);
                 break;
             }
 
-            fast_seq.copy_literals(&mut out, &mut input);
+            // fast_seq.copy_literals(&mut out, &mut input);
 
             fast_seq.read_offset(&out, &mut input)?;
 
-            let status = fast_seq.read_match_length(&out, &mut input)?;
+            let status = fast_seq.read_match_length(&mut out, &mut input)?;
             // fast_seq.copy_match_prefix(&mut out);
             if status == Lz4Status::End {
-                end_seq = fast_seq.to_end(Lz4SequenceState::MatchLengthRead);
+                end_seq = fast_seq.to_end(Lz4SequenceState::SequenceStart);
                 break;
             }
 
-            fast_seq.copy_match(&mut out);
+            // fast_seq.copy_match(&mut out);
         }
     }
     // End loop
