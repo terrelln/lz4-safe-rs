@@ -117,7 +117,7 @@ fn main() {
             decompress_into(&compressed, &mut decompressed).expect("Flex failed");
         } else if false {
             block::decompress(&compressed, Some(data.len() as i32)).expect("lz4-block failed");
-        } else if true {
+        } else if false {
             let _dsize = lz4_decompress(&mut decompressed, &compressed).expect("Lz4 decompression failed");
         } else if false {
             decompress_raw(&compressed, &[], &mut decompressed, data.len()).expect("lz-fear decompression failed");
