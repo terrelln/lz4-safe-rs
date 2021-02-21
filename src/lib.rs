@@ -1,5 +1,4 @@
 #![feature(core_intrinsics)]
-#![feature(slice_fill)]
 
 mod decompress;
 mod cursor;

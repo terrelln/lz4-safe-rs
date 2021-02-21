@@ -11,7 +11,12 @@ name = "lz4_safe"
 [profile.release]
 debug = true
 
+[features]
+default = ["std"]
+std = []
+
 [dependencies]
+# lz4_flex = { version = "0.7.5" }
 lz4_flex = { version = "0.7.5", default-features = false }
 # lz4_flex = { version = "0.7.5", default-features = false, features = ["checked-decode"] }
 lz4-sys = "1.9.2"

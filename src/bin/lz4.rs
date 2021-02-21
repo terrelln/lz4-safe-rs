@@ -109,17 +109,20 @@ fn main() {
     compressed.resize(csize, 0);
     // let mut decompressed = block::decompress(&data, Some(10000000)).expect("lz4-block failed");
     let mut decompressed = Vec::new();
+    // decompressed.reserve(data.len() + 16);
     decompressed.resize(data.len(), 0);
     let mut time = None;
     for _ in 0..100 {
         let start = Instant::now();
         if false {
+            // decompressed.clear();
             decompress_into(&compressed, &mut decompressed).expect("Flex failed");
         } else if false {
             block::decompress(&compressed, Some(data.len() as i32)).expect("lz4-block failed");
         } else if false {
             let _dsize = lz4_decompress(&mut decompressed, &compressed).expect("Lz4 decompression failed");
         } else if false {
+            decompressed.clear();
             decompress_raw(&compressed, &[], &mut decompressed, data.len()).expect("lz-fear decompression failed");
         } else {
             let _dsize = decompress(&mut decompressed, &compressed).expect("Lz4 decompression failed");
