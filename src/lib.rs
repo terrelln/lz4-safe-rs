@@ -1,4 +1,5 @@
 #![feature(core_intrinsics)]
+#![feature(test)]
 
 mod decompress;
 mod cursor;

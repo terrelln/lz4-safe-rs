@@ -217,12 +217,72 @@ pub fn duplicating_copy(buf: &mut [u8], mut idx: Idx, offset: Offset, len: Len, 
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     extern crate test;
-//     use test::Bencher;
-//     use super::*;
+#[cfg(test)]
+mod tests {
+    extern crate test;
+    use test::Bencher;
+    use super::*;
 
-//     #[test]
+    fn bench_offset(b: &mut Bencher, offset: usize) {
+        let mut vec = Vec::new();
+        vec.resize(1024 + 16 + offset, 0);
+        b.iter(|| {
+            duplicating_copy(&mut vec, Idx(offset), Offset(offset), Len(1024), CopyMode::Fast);
+        });
+    }
 
-// }
+    #[bench]
+    fn bench_offset_1(b: &mut Bencher) {
+        bench_offset(b, 1);
+    }
+
+    #[bench]
+    fn bench_offset_2(b: &mut Bencher) {
+        bench_offset(b, 2);
+    }
+
+    #[bench]
+    fn bench_offset_4(b: &mut Bencher) {
+        bench_offset(b, 4);
+    }
+
+    #[bench]
+    fn bench_offset_8(b: &mut Bencher) {
+        bench_offset(b, 8);
+    }
+
+    #[bench]
+    fn bench_offset_9(b: &mut Bencher) {
+        bench_offset(b, 9);
+    }
+
+    #[bench]
+    fn bench_offset_15(b: &mut Bencher) {
+        bench_offset(b, 15);
+    }
+
+    #[bench]
+    fn bench_offset_16(b: &mut Bencher) {
+        bench_offset(b, 16);
+    }
+
+    #[bench]
+    fn bench_offset_17(b: &mut Bencher) {
+        bench_offset(b, 17);
+    }
+
+    #[bench]
+    fn bench_offset_31(b: &mut Bencher) {
+        bench_offset(b, 31);
+    }
+
+    #[bench]
+    fn bench_offset_32(b: &mut Bencher) {
+        bench_offset(b, 32);
+    }
+
+    #[bench]
+    fn bench_offset_33(b: &mut Bencher) {
+        bench_offset(b, 33);
+    }
+}
