@@ -1,0 +1,29 @@
+
+[package]
+name = "lz4-safe-rs-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2018"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.3"
+lz4 = "1.23.1"
+
+[dependencies.lz4-safe-rs]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_decompress"
+path = "fuzz_targets/fuzz_decompress.rs"
+
+[[bin]]
+name = "fuzz_round_trip"
+path = "fuzz_targets/fuzz_round_trip.rs"

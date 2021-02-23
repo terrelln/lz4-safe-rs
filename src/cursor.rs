@@ -3,6 +3,9 @@ use core::intrinsics::{likely, unlikely};
 use super::copy::*;
 use super::{Error, Result};
 
+pub const COPY_LITERALS_OVER_LENGTH: usize = 32;
+pub const COPY_MATCH_OVER_LENGTH: usize = 32;
+
 pub struct InputCursor<'a> {
     src: &'a [u8],
 }
@@ -65,7 +68,6 @@ impl InputCursor<'_> {
         let mut value = token;
 
         if fast {
-            debug_assert!(self.has(1));
             let next = self.read_u8() as usize;
             value += next;
             if next != 255 {
@@ -140,18 +142,8 @@ impl OutputCursor<'_> {
     #[inline(always)]
     pub fn copy_literals(&mut self, src: &mut InputCursor, literal_length: usize, fast: bool) {
         if fast && likely(literal_length <= 32) {
-            debug_assert!(self.has(32));
-            debug_assert!(src.has(32));
-            let dst_slice = &mut self.dst[self.idx..self.idx + 32];
-            dst_slice.copy_from_slice(src.slice(Some(32)));
+            copy_stripe(&mut self.dst[self.idx..], src.slice(None), Stripe(32));
         } else {
-            if fast {
-                debug_assert!(self.has(literal_length + 32));
-                debug_assert!(src.has(literal_length + 32));
-            } else {
-                debug_assert!(self.has(literal_length));
-                debug_assert!(src.has(literal_length));
-            }
             striped_copy(
                 &mut self.dst[self.idx..],
                 src.slice(None),
@@ -167,11 +159,6 @@ impl OutputCursor<'_> {
     #[inline(always)]
     pub fn copy_match(&mut self, offset: usize, match_length: usize, fast: bool) {
         debug_assert!(self.validate_offset(offset).is_ok());
-        if fast {
-            debug_assert!(self.has(match_length + 32));
-        } else {
-            debug_assert!(self.has(match_length));
-        }
         duplicating_copy(
             self.dst,
             Idx(self.idx),
@@ -191,7 +178,6 @@ impl OutputCursor<'_> {
     #[inline(always)]
     pub fn copy_short_match(&mut self, offset: usize, match_length: usize) {
         debug_assert!(match_length <= 18);
-        debug_assert!(self.has(32));
         copy_stripe_within(self.dst, Idx(self.idx), Offset(offset), Stripe(18));
         self.advance(match_length);
     }

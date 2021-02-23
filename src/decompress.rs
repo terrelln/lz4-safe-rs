@@ -1,5 +1,4 @@
-use super::copy::{COPY_LITERALS_OVER_LENGTH, COPY_MATCH_OVER_LENGTH};
-use super::cursor::{InputCursor, OutputCursor};
+use super::cursor::{InputCursor, OutputCursor, COPY_LITERALS_OVER_LENGTH, COPY_MATCH_OVER_LENGTH};
 use super::{Error, Result};
 
 use core::intrinsics::likely;
@@ -286,8 +285,8 @@ pub fn decompress(dst: &mut [u8], src: &[u8]) -> Result<usize> {
     let mut end_seq = EndLz4Sequence::new();
     let mut out = OutputCursor::new(dst);
     let mut input = InputCursor::new(src);
-    // Fast loop
 
+    // Fast loop
     if input.has(FAST_LOOP_LEN) && out.has(FAST_LOOP_LEN) {
         loop {
             // Initial state

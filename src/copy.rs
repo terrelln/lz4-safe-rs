@@ -1,8 +1,5 @@
 use core::intrinsics::likely;
 
-pub const COPY_LITERALS_OVER_LENGTH: usize = 32;
-pub const COPY_MATCH_OVER_LENGTH: usize = 32;
-
 #[derive(Clone, Copy)]
 pub struct Stripe(pub usize);
 #[derive(Clone, Copy)]
@@ -35,21 +32,12 @@ pub fn copy_stripe(dst: &mut [u8], src: &[u8], stripe: Stripe) {
     dst_stripe.copy_from_slice(src_stripe);
 }
 
-fn striped_copy_len(len: Len, stripe: Stripe) -> usize {
-    let num_stripes = len.0 / stripe.0;
-    let num_stripes = if len.0 % stripe.0 > 0 {
-        num_stripes + 1
-    } else if len.0 > 0 {
-        num_stripes
-    } else {
-        1
-    };
-    num_stripes * stripe.0
+fn striped_copy_bound(len: Len, stripe: Stripe) -> usize {
+    len.0 + stripe.0
 }
 
 /// Copies `src` to `dst` in stripes of size `stripe`, which should be constant.
-/// In `Fast` mode it will copy the first multiple of `stripe` bytes at least as large as `len`,
-/// but will always copy at least `stripe` bytes. See [striped_copy_len](striped_copy_len).
+/// In `Fast` mode it may copy up to `stripe` bytes beyond `len`.
 /// In `End` mode it will copy exactly `len` bytes.
 ///
 /// # Panics
@@ -58,8 +46,8 @@ fn striped_copy_len(len: Len, stripe: Stripe) -> usize {
 pub fn striped_copy(dst: &mut [u8], src: &[u8], len: Len, stripe: Stripe, mode: CopyMode) {
     match mode {
         CopyMode::Fast => {
-            debug_assert!(src.len() >= striped_copy_len(len, stripe));
-            debug_assert!(dst.len() >= striped_copy_len(len, stripe));
+            debug_assert!(src.len() >= striped_copy_bound(len, stripe));
+            debug_assert!(dst.len() >= striped_copy_bound(len, stripe));
             let mut idx = 0;
             loop {
                 let dst_stripe = &mut dst[idx..idx + stripe.0];
@@ -90,17 +78,15 @@ pub fn copy_stripe_within(buf: &mut [u8], idx: Idx, offset: Offset, stripe: Stri
 }
 
 /// Copies `buf[idx-offset..idx-offset+len]` to `buf[idx..idx+len]`.
-/// In `Fast` mode it will copy the first multiple of `stripe` bytes at least as large as `len`,
-/// but will always copy at least `stripe` bytes. See [striped_copy_len](striped_copy_len).
+/// In `Fast` mode it may copy up to `stripe` bytes beyond `len`.
 /// In `End` mode it will copy exactly `len` bytes.
-/// Requires that `0 < offset <= 16`.
+/// Requires that `offset <= 16`. If `offset == 0` it sets the output to 0.
 ///
 /// # Panics
 /// Panics if `buf` isn't large enough, or if `offset > idx`, or if `offset > 16`.
 /// May panic if `offset == 0`, or may set output to an undefined value.
 #[inline(always)]
 fn short_duplicating_copy(buf: &mut [u8], mut idx: Idx, offset: Offset, len: Len, mode: CopyMode) {
-    debug_assert!(offset.0 > 0);
     debug_assert!(offset.0 < 16);
     debug_assert!(offset.0 <= idx.0);
     debug_assert!(idx.0 + len.0 <= buf.len());
@@ -148,7 +134,7 @@ fn short_duplicating_copy(buf: &mut [u8], mut idx: Idx, offset: Offset, len: Len
     debug_assert!(pattern_len <= 16);
     match mode {
         CopyMode::Fast => {
-            debug_assert!(idx.0 + striped_copy_len(len, Stripe(16)) <= buf.len());
+            debug_assert!(idx.0 + striped_copy_bound(len, Stripe(16)) <= buf.len());
             loop {
                 copy_stripe(&mut buf[idx.0..idx.0 + 16], &pattern, Stripe(16));
                 idx.0 += pattern_len;
@@ -178,14 +164,12 @@ fn short_duplicating_copy(buf: &mut [u8], mut idx: Idx, offset: Offset, len: Len
 }
 
 /// Copies `buf[idx-offset..idx-offset+len]` to `buf[idx..idx+len]`.
-/// In `Fast` mode it will copy the first multiple of `stripe` bytes at least as large as `len`,
-/// but will always copy at least `stripe` bytes. See [striped_copy_len](striped_copy_len).
+/// In `Fast` mode it may copy up to `stripe` bytes beyond `len`.
 /// In `End` mode it will copy exactly `len` bytes.
-/// Requires that `0 < offset <= idx`.
+/// Requires that `offset <= idx`. Offset == 0 sets the output to 0.
 ///
 /// # Panics
 /// Panics if `buf` isn't large enough, or if `offset > idx`.
-/// May panic if `offset == 0`, or may set output to an undefined value.
 #[inline(always)]
 pub fn duplicating_copy(buf: &mut [u8], mut idx: Idx, offset: Offset, len: Len, mode: CopyMode) {
     debug_assert!(offset.0 <= idx.0);
@@ -220,14 +204,107 @@ pub fn duplicating_copy(buf: &mut [u8], mut idx: Idx, offset: Offset, len: Len, 
 #[cfg(test)]
 mod tests {
     extern crate test;
-    use test::Bencher;
     use super::*;
+    use test::Bencher;
+
+    #[test]
+    fn test_copy_stripe() {
+        for stripe in 1..32usize {
+            let src: Vec<u8> = (0u8..stripe as u8).into_iter().collect();
+            let mut dst = Vec::new();
+            dst.resize(stripe, 0xFF);
+            copy_stripe(&mut dst, &src, Stripe(stripe));
+            assert_eq!(src, dst);
+        }
+    }
+
+    #[test]
+    fn test_striped_copy() {
+        for stripe in 1..32usize {
+            for len in 0..4 * stripe {
+                let mut src: Vec<u8> = (0u8..len as u8).into_iter().collect();
+                let mut dst = Vec::new();
+                // End
+                dst.resize(len, 0xFF);
+                striped_copy(&mut dst, &src, Len(len), Stripe(stripe), CopyMode::End);
+                assert_eq!(src, dst);
+                // Fast
+                src.resize(striped_copy_bound(Len(len), Stripe(stripe)), 0xFF);
+                dst.clear();
+                dst.resize(striped_copy_bound(Len(len), Stripe(stripe)), 0xFF);
+                striped_copy(&mut dst, &src, Len(len), Stripe(stripe), CopyMode::Fast);
+                assert_eq!(src[0..len], dst[0..len]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_copy_stripe_within() {
+        for stripe in 1..32usize {
+            for offset in stripe..2 * stripe {
+                for idx in offset..offset + 1 {
+                    let mut buf: Vec<u8> = (0u8..(offset + stripe) as u8).into_iter().collect();
+                    copy_stripe_within(&mut buf, Idx(idx), Offset(offset), Stripe(stripe));
+                    let src = &buf[idx - offset..idx - offset + stripe];
+                    let dst = &buf[idx..idx + stripe];
+                    assert_eq!(src, dst);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_duplicating_copy() {
+        for offset in 0..64usize {
+            for idx in offset..offset + 1 {
+                for len in 1..190usize {
+                    let initial: Vec<u8> = (0u8..(idx + len) as u8).into_iter().collect();
+                    let mut expected = initial.clone();
+                    for pos in idx..idx + len {
+                        let expect = if offset == 0 { 0 } else { expected[pos - offset] } as u8;
+                        expected[pos] = expect;
+                    }
+                    // End
+                    {
+                        let mut buf = initial.clone();
+                        duplicating_copy(
+                            &mut buf,
+                            Idx(idx),
+                            Offset(offset),
+                            Len(len),
+                            CopyMode::End,
+                        );
+                        assert_eq!(buf, expected);
+                    }
+                    // Fast
+                    {
+                        let mut buf = initial.clone();
+                        buf.resize(idx + striped_copy_bound(Len(len), Stripe(16)), 0xFF);
+                        duplicating_copy(
+                            &mut buf,
+                            Idx(idx),
+                            Offset(offset),
+                            Len(len),
+                            CopyMode::Fast,
+                        );
+                        assert_eq!(buf[..idx + len], expected);
+                    }
+                }
+            }
+        }
+    }
 
     fn bench_offset(b: &mut Bencher, offset: usize) {
         let mut vec = Vec::new();
         vec.resize(1024 + 16 + offset, 0);
         b.iter(|| {
-            duplicating_copy(&mut vec, Idx(offset), Offset(offset), Len(1024), CopyMode::Fast);
+            duplicating_copy(
+                &mut vec,
+                Idx(offset),
+                Offset(offset),
+                Len(1024),
+                CopyMode::Fast,
+            );
         });
     }
 
