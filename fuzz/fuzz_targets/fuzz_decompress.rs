@@ -8,9 +8,9 @@ fuzz_target!(|data: &[u8]| {
     let mut data = data;
 
     let len = if data.len() >= 4 {
-        let len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize & 0x3FFFF;
         data = &data[4..];
-        std::cmp::min(len, 1024 * 1024)
+        std::cmp::min(len, data.len() * 100)
     } else if data.len() >= 1 {
         let len = data[0] as usize;
         data = &data[1..];

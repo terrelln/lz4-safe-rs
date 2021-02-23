@@ -46,8 +46,7 @@ const SHORT_LITERAL_BYTES: usize = COPY_LITERALS_OVER_LENGTH;
 const OFFSET_BYTES: usize = 2;
 const SHORT_MATCH_BYTES: usize = COPY_MATCH_OVER_LENGTH;
 
-const HALF_FAST_LOOP_LEN: usize = 32;
-const FAST_LOOP_LEN: usize = 2 * HALF_FAST_LOOP_LEN;
+const FAST_LOOP_LEN: usize = 64;
 
 impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
     fn new() -> Self {
@@ -77,7 +76,6 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
     fn check_state_conditions(&self, out: Option<&OutputCursor>, src: &InputCursor) {
         match self.state {
             Lz4SequenceState::SequenceStart => {
-                debug_assert!(src.has(1));
                 if Mode::IS_FAST {
                     debug_assert!(src.has(TOKEN_BYTES + SHORT_LITERAL_BYTES));
                 }
@@ -95,7 +93,7 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
                 let out = out.unwrap();
                 debug_assert!(self.match_length <= MATCH_TOKEN_MAX);
                 if Mode::IS_FAST {
-                    debug_assert!(out.has(SHORT_MATCH_BYTES + SHORT_LITERAL_BYTES));
+                    debug_assert!(out.has(SHORT_MATCH_BYTES));
                     debug_assert!(src.has(OFFSET_BYTES + TOKEN_BYTES + SHORT_LITERAL_BYTES));
                 }
             }
@@ -104,7 +102,7 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
                 debug_assert!(self.match_length <= MATCH_TOKEN_MAX);
                 debug_assert!(out.validate_offset(self.offset).is_ok());
                 if Mode::IS_FAST {
-                    debug_assert!(out.has(SHORT_MATCH_BYTES + SHORT_LITERAL_BYTES));
+                    debug_assert!(out.has(SHORT_MATCH_BYTES));
                     debug_assert!(src.has(TOKEN_BYTES + SHORT_LITERAL_BYTES));
                 }
             }
@@ -143,8 +141,11 @@ enum Lz4Status {
 
 impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
     #[inline(always)]
-    fn read_token(&mut self, src: &mut InputCursor) {
+    fn read_token(&mut self, src: &mut InputCursor) -> Result<()> {
         self.check_state(Lz4SequenceState::SequenceStart, None, src);
+        if !Mode::IS_FAST && src.is_empty() {
+            return Err(Error::Truncation);
+        }
         // No bounds check because if we were out of bytes we would be in the
         // end state.
         let token = src.read_u8();
@@ -154,6 +155,7 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
         self.set_state(Lz4SequenceState::TokenRead);
         self.literal_length = literal_token;
         self.match_length = match_token;
+        Ok(())
     }
 
     #[inline(always)]
@@ -184,7 +186,7 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
         let has = |len| out.has(len) && src.has(len);
 
         // Need space for the over-copy
-        let over_length = self.literal_length + HALF_FAST_LOOP_LEN;
+        let over_length = self.literal_length + FAST_LOOP_LEN;
         if Mode::IS_FAST && has(over_length) {
             out.copy_literals(src, self.literal_length, true);
             self.set_state(Lz4SequenceState::LiteralsCopied);
@@ -255,7 +257,11 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
         if Mode::IS_FAST && out.has(self.match_length + FAST_LOOP_LEN) {
             out.copy_match(self.offset, self.match_length, true);
             self.set_state(Lz4SequenceState::SequenceStart);
-            Ok(Lz4Status::Fast)
+            if src.has(FAST_LOOP_LEN) {
+                Ok(Lz4Status::Fast)
+            } else {
+                Ok(Lz4Status::End)
+            }
         } else if out.has(self.match_length) {
             out.copy_match(self.offset, self.match_length, false);
             self.set_state(Lz4SequenceState::SequenceStart);
@@ -269,7 +275,7 @@ impl<Mode: Lz4Mode> Lz4Sequence<Mode> {
 impl Lz4Sequence<Lz4End> {
     fn next(&mut self, out: &mut OutputCursor, src: &mut InputCursor) -> Result<()> {
         match self.state {
-            Lz4SequenceState::SequenceStart => Ok(self.read_token(src)),
+            Lz4SequenceState::SequenceStart => self.read_token(src),
             Lz4SequenceState::TokenRead => self.read_literal_length(out, src).map(|_| ()),
             Lz4SequenceState::LiteralsCopied => self.read_offset(out, src),
             Lz4SequenceState::OffsetRead => self.read_match_length(out, src).map(|_| ()),
@@ -292,7 +298,7 @@ pub fn decompress(dst: &mut [u8], src: &[u8]) -> Result<usize> {
             // Initial state
             let mut fast_seq = FastLz4Sequence::new();
 
-            fast_seq.read_token(&mut input);
+            fast_seq.read_token(&mut input)?;
 
             let status = fast_seq.read_literal_length(&mut out, &mut input)?;
             if status == Lz4Status::End {
